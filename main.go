@@ -11,13 +11,8 @@ import (
 
 // ================= 配置区 =================
 const (
-	// 1. 你的飞牛地址
 	FN_URL = "http://192.168.100.44:5666"
-
-	// 2. 你的身份令牌（Bearer 后面记得加空格）
-	TOKEN = "Bearer 你的TOKEN粘贴在这里"
-
-	// 3. 检查频率（1分钟检查一次）
+	TOKEN  = "Bearer 1ae45321e2ae42ed8a5723f39d62cc4"
 	INTERVAL = 1
 )
 // ==========================================
@@ -60,22 +55,76 @@ func checkNewMedia() {
 
 	if len(result.Data.Items) > 0 {
 		latest := result.Data.Items[0]
+		
 		if lastID == 0 {
 			lastID = latest.ID
-			fmt.Printf("【监控启动】当前最新内容: %s\n", latest.Name)
+			fmt.Printf("【监控已启动】当前最新内容: %s\n", latest.Name)
 			return
 		}
+
 		if latest.ID > lastID {
-			fmt.Printf("🚀 监测到新入库：%s\n", latest.Name)
+			fmt.Printf("🚀 监测到新片入库：%s\n", latest.Name)
 			lastID = latest.ID
 		}
 	}
 }
 
+// 供 Web 按钮调用的测试功能
+func triggerTestNotification() {
+	fmt.Println("🔔 收到 Web 端发起的【测试入库通知】请求！")
+	// 未来你的微信/PushDeer推送代码可以写在这里
+}
+
 func main() {
-	fmt.Println("飞牛全库入库监控已启动...")
-	for {
-		checkNewMedia()
-		time.Sleep(time.Duration(INTERVAL) * time.Minute)
-	}
+	fmt.Println("--------------------------------")
+	fmt.Println("  飞牛 fnshow 增强版监控 运行中  ")
+	fmt.Println("  Web 测试面板已在 5001 端口就绪 ")
+	fmt.Println("--------------------------------")
+	
+	// 1. 开启后台静默监控
+	go func() {
+		for {
+			checkNewMedia()
+			time.Sleep(time.Duration(INTERVAL) * time.Minute)
+		}
+	}()
+
+	// 2. 提供 Web 界面
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		html := `<!DOCTYPE html>
+		<html>
+		<head>
+			<meta charset="UTF-8">
+			<title>入库通知测试</title>
+			<style>
+				body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; background-color: #f4f4f9; }
+				button { padding: 15px 30px; font-size: 18px; color: white; background-color: #007bff; border: none; border-radius: 5px; cursor: pointer; }
+				button:hover { background-color: #0056b3; }
+				#msg { margin-top: 20px; font-size: 16px; color: green; font-weight: bold; }
+			</style>
+		</head>
+		<body>
+			<h2>飞牛入库通知 - 独立测试面板</h2>
+			<button onclick="sendTest()">发送测试通知</button>
+			<div id="msg"></div>
+			<script>
+				function sendTest() {
+					fetch('/test').then(res => res.text()).then(text => {
+						document.getElementById('msg').innerText = text + " (" + new Date().toLocaleTimeString() + ")";
+					});
+				}
+			</script>
+		</body>
+		</html>`
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(html))
+	})
+
+	http.HandleFunc("/test", func(w http.ResponseWriter, r *http.Request) {
+		triggerTestNotification()
+		w.Write([]byte("✅ 测试请求已发送，请查看 Docker 日志！"))
+	})
+
+	// 监听 5001 端口
+	http.ListenAndServe(":5001", nil)
 }
