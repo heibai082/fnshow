@@ -1,25 +1,33 @@
-# 阶段 1：编译 Go 程序
-FROM golang:1.21-alpine AS go-builder
+# 第一阶段：编译环境
+FROM golang:1.21-alpine AS builder
+
+# 设置工作目录
 WORKDIR /app
+
+# 设置代理（国内环境编译更快，如果不需要可以删掉）
+ENV GOPROXY=https://goproxy.cn,direct
+
+# 复制源代码并初始化项目（强制覆盖旧的 mod）
 COPY main.go .
-RUN go mod init fnshow || true && go mod tidy && go build -o fnshow main.go
+RUN go mod init fnshow || true && \
+    go mod tidy && \
+    go build -o fnshow main.go
 
-# 阶段 2：运行原版 Python Web + 新版 Go 测试面板
-FROM python:3.9-slim
+# 第二阶段：运行环境
+FROM alpine:latest
+
+# 安装基础证书（确保能发送 https 请求到推送接口）
+RUN apk --no-cache add ca-certificates
+
 WORKDIR /app
 
-# 把 GitHub 上的所有原始文件拷进来
-COPY . .
-# 把刚才编译好的 Go 程序拷进来
-COPY --from=go-builder /app/fnshow .
+# 从编译阶段拷贝生成的程序
+COPY --from=builder /app/fnshow .
 
-# 安装原项目的 Python 依赖 (如果出错也跳过，防止原项目依赖冲突导致容器起不来)
-RUN pip install --no-cache-dir -r requirements.txt || true
+# 暴露端口：
+# 5000: 接收飞牛 Webhook (播放/停止)
+# 5001: 网页测试面板
+EXPOSE 5000 5001
 
-# 创建一个启动脚本，让后台的 Go 和前台的 Python 同时运行
-RUN echo '#!/bin/sh' > start.sh && \
-    echo './fnshow &' >> start.sh && \
-    echo 'python main.py' >> start.sh && \
-    chmod +x start.sh
-
-CMD ["./start.sh"]
+# 启动程序
+CMD ["./fnshow"]
