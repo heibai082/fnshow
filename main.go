@@ -12,40 +12,90 @@ import (
 
 // ================= 配置区 =================
 const (
-	FN_URL   = "http://192.168.100.44:5666"
-	TOKEN    = "Bearer 1ae45321e2ae42ed8a5723f39d62cc4"
-	INTERVAL = 1
+	FN_URL   = "http://192.168.100.44:5666" // 飞牛地址
+	INTERVAL = 1                          // 监控间隔（分钟）
 )
-
 // ==========================================
 
-var lastID int = 0
+var (
+	currentToken string
+	lastID       int = 0
+)
 
-// 核心监控逻辑：轮询飞牛 API
-func checkNewMedia() {
-	url := fmt.Sprintf("%s/api/v1/item/list", FN_URL)
-	payload := map[string]interface{}{
-		"page_size":   1,
-		"sort_column": "create_time",
-		"sort_type":   "DESC",
-		"tags": map[string]interface{}{
-			"type": []string{"Movie", "TV"},
-		},
+// 自动登录获取 Token
+func getAutoToken() string {
+	user, pwd := os.Getenv("FN_USER"), os.Getenv("FN_PWD")
+	if user == "" || pwd == "" {
+		fmt.Println("⚠️ 错误：未在环境变量中配置 FN_USER 或 FN_PWD")
+		return ""
 	}
 
+	loginURL := fmt.Sprintf("%s/api/v1/auth/login", FN_URL)
+	payload := map[string]string{"username": user, "password": pwd}
 	jsonData, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	req.Header.Set("Authorization", TOKEN)
+
+	resp, err := http.Post(loginURL, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		fmt.Printf("❌ 登录飞牛失败: %v\n", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Data struct{ Token string } `json:"data"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+
+	if result.Data.Token != "" {
+		fmt.Println("✅ 自动登录成功，Token 已更新")
+		return "Bearer " + result.Data.Token
+	}
+	return ""
+}
+
+// 通用发送通知函数
+func sendNotify(title, message string) {
+	notifyURL := os.Getenv("NOTIFY_API_URL")
+	if notifyURL == "" {
+		fmt.Println("⚠️ 未配置 NOTIFY_API_URL，无法发送通知")
+		return
+	}
+
+	payload := map[string]string{"title": title, "message": message}
+	jsonData, _ := json.Marshal(payload)
+	
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(notifyURL, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		fmt.Printf("❌ 通知发送失败: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+	fmt.Printf("🚀 通知已送达: [%s] %s\n", title, message)
+}
+
+// 检查新片入库
+func checkNewMedia() {
+	if currentToken == "" {
+		currentToken = getAutoToken()
+		if currentToken == "" { return }
+	}
+
+	url := fmt.Sprintf("%s/api/v1/item/list", FN_URL)
+	payload := []byte(`{"page_size":1,"sort_column":"create_time","sort_type":"DESC","tags":{"type":["Movie","TV"]}}`)
+	
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(payload))
+	req.Header.Set("Authorization", currentToken)
 	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
-	if err != nil {
+	if err != nil || resp.StatusCode == 401 {
+		currentToken = "" // 失效则清空以便下次重连
 		return
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
 	var result struct {
 		Data struct {
 			Items []struct {
@@ -54,65 +104,53 @@ func checkNewMedia() {
 			} `json:"items"`
 		} `json:"data"`
 	}
-	json.Unmarshal(body, &result)
+	json.NewDecoder(resp.Body).Decode(&result)
 
 	if len(result.Data.Items) > 0 {
 		latest := result.Data.Items[0]
-
-		if lastID == 0 {
-			lastID = latest.ID
-			fmt.Printf("【监控已启动】当前最新内容: %s\n", latest.Name)
-			return
+		if lastID != 0 && latest.ID > lastID {
+			sendNotify("🎬 新片入库", "发现新内容："+latest.Name)
 		}
-
-		if latest.ID > lastID {
-			fmt.Printf("🚀 监测到新片入库：%s\n", latest.Name)
-			lastID = latest.ID
-			// 自动触发通知（可选：如果你想入库时也自动发通知，可以调用 triggerTestNotification）
-		}
+		lastID = latest.ID
 	}
 }
 
-// 供 Web 按钮调用的测试功能：向你配置的 NOTIFY_API_URL 发送通知
-func triggerTestNotification() {
-	fmt.Println("🔔 收到 Web 端发起的【测试入库通知】请求！")
-
-	// 自动从系统环境变量读取你在飞牛配置的 URL
-	notifyURL := os.Getenv("NOTIFY_API_URL")
-	if notifyURL == "" {
-		fmt.Println("❌ 错误：未在容器环境变量中找到 NOTIFY_API_URL")
+// 接收飞牛 Webhook（处理播放、停止等）
+func handleWebhook(w http.ResponseWriter, r *http.Request) {
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		return
 	}
 
-	// 构造测试数据
-	testData := map[string]interface{}{
-		"title":   "【监控测试】",
-		"message": "这是一条来自 Web 测试面板的入库通知测试，证明通道已打通！",
-	}
-	jsonData, _ := json.Marshal(testData)
+	// 提取飞牛发过来的事件内容（根据飞牛标准 webhook 格式）
+	eventType, _ := body["event"].(string)
+	data, _ := body["data"].(map[string]interface{})
+	itemName, _ := data["item_name"].(string)
+	userName, _ := data["user_name"].(string)
 
-	// 发送 POST 请求到你的通知接口
-	resp, err := http.Post(notifyURL, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		fmt.Printf("❌ 发送失败: %v\n", err)
-		return
+	var title, msg string
+	switch eventType {
+	case "item.play":
+		title = "▶️ 正在播放"
+		msg = fmt.Sprintf("用户 [%s] 正在观看: %s", userName, itemName)
+	case "item.stop":
+		title = "⏹️ 停止播放"
+		msg = fmt.Sprintf("用户 [%s] 停止观看: %s", userName, itemName)
+	default:
+		title = "🔔 飞牛提醒"
+		msg = fmt.Sprintf("事件: %s, 内容: %s", eventType, itemName)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK || resp.StatusCode == 201 {
-		fmt.Println("✅ 测试通知已成功推送到目标接口！")
-	} else {
-		fmt.Printf("⚠️ 接口返回异常状态码: %d\n", resp.StatusCode)
+	if itemName != "" {
+		sendNotify(title, msg)
 	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func main() {
-	fmt.Println("--------------------------------")
-	fmt.Println("  飞牛 fnshow 增强版监控 运行中  ")
-	fmt.Println("  Web 测试面板已在 5001 端口就绪 ")
-	fmt.Println("--------------------------------")
+	fmt.Println("🚀 飞牛全能监控助手已启动...")
 
-	// 1. 开启后台静默监控
+	// 1. 周期性检查新片
 	go func() {
 		for {
 			checkNewMedia()
@@ -120,50 +158,27 @@ func main() {
 		}
 	}()
 
-	// 2. 提供 Web 界面
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		html := `<!DOCTYPE html>
-		<html>
-		<head>
-			<meta charset="UTF-8">
-			<title>入库通知测试</title>
-			<style>
-				body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; background-color: #f4f4f9; }
-				button { padding: 15px 30px; font-size: 18px; color: white; background-color: #007bff; border: none; border-radius: 5px; cursor: pointer; }
-				button:hover { background-color: #0056b3; }
-				#msg { margin-top: 20px; font-size: 16px; color: green; font-weight: bold; }
-			</style>
-		</head>
-		<body>
-			<h2>飞牛入库通知 - 独立测试面板</h2>
-			<p>点击下方按钮，测试是否能收到通知消息</p>
-			<button onclick="sendTest()">发送测试通知</button>
-			<div id="msg"></div>
-			<script>
-				function sendTest() {
-					const msgDiv = document.getElementById('msg');
-					msgDiv.innerText = "正在发送...";
-					fetch('/test').then(res => res.text()).then(text => {
-						msgDiv.innerText = text + " (" + new Date().toLocaleTimeString() + ")";
-					}).catch(err => {
-						msgDiv.innerText = "请求失败，请检查 Docker 日志";
-					});
-				}
-			</script>
-		</body>
-		</html>`
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(html))
-	})
+	// 2. 监听 5000 端口（接收飞牛原有的播放/停止 Webhook）
+	http.HandleFunc("/webhook", handleWebhook) // 建议飞牛 Webhook 地址填这个
+	http.HandleFunc("/", handleWebhook)        // 兼容模式：直接填 IP:端口 也能收到
 
-	http.HandleFunc("/test", func(w http.ResponseWriter, r *http.Request) {
-		triggerTestNotification()
-		w.Write([]byte("✅ 测试请求已处理，请查看手机或 Docker 日志！"))
-	})
+	// 3. 监听 5001 端口（提供 Web 测试按钮）
+	go func() {
+		testMux := http.NewServeMux()
+		testMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprint(w, `<html><body style="text-align:center;padding-top:50px;">
+				<h2>飞牛通知测试控制台</h2>
+				<button style="padding:15px 30px;" onclick="fetch('/test').then(()=>alert('发送请求成功，请检查手机'))">点击发送测试通知</button>
+			</body></html>`)
+		})
+		testMux.HandleFunc("/test", func(w http.ResponseWriter, r *http.Request) {
+			sendNotify("🧪 手动测试", "这是一条来自测试按钮的消息")
+			w.Write([]byte("ok"))
+		})
+		http.ListenAndServe(":5001", testMux)
+	}()
 
-	// 监听 5001 端口
-	err := http.ListenAndServe(":5001", nil)
-	if err != nil {
-		fmt.Printf("❌ Web 服务器启动失败: %v\n", err)
-	}
+	// 启动主服务（5000 端口）
+	http.ListenAndServe(":5000", nil)
 }
