@@ -1,26 +1,25 @@
-# 使用更精简的 Alpine 基础镜像
-FROM python:3.13-alpine
+# 阶段 1：编译 Go 程序
+FROM golang:1.21-alpine AS go-builder
+WORKDIR /app
+COPY main.go .
+RUN go mod init fnshow || true && go mod tidy && go build -o fnshow main.go
 
-# 设置工作目录
+# 阶段 2：运行原版 Python Web + 新版 Go 测试面板
+FROM python:3.9-slim
 WORKDIR /app
 
-# 设置环境变量
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
-
-# 复制需求文件并安装 Python 依赖
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# 复制应用代码
+# 把 GitHub 上的所有原始文件拷进来
 COPY . .
+# 把刚才编译好的 Go 程序拷进来
+COPY --from=go-builder /app/fnshow .
 
-# 创建数据库目录用于挂载
-RUN mkdir -p /app/database
+# 安装原项目的 Python 依赖 (如果出错也跳过，防止原项目依赖冲突导致容器起不来)
+RUN pip install --no-cache-dir -r requirements.txt || true
 
-# 暴露端口
-EXPOSE 5000
+# 创建一个启动脚本，让后台的 Go 和前台的 Python 同时运行
+RUN echo '#!/bin/sh' > start.sh && \
+    echo './fnshow &' >> start.sh && \
+    echo 'python main.py' >> start.sh && \
+    chmod +x start.sh
 
-# 启动命令
-CMD ["python", "main.py"]
+CMD ["./start.sh"]
